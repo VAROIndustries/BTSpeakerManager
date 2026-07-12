@@ -1,6 +1,6 @@
 # BTSpeakerManager
 
-_Built by [VARØ Industries](https://varo.industries/apps)_
+_Built by [VARØ Industries](https://varo.industries/apps#github)_
 
 A Windows system tray app that keeps Bluetooth speakers alive and connected.
 
