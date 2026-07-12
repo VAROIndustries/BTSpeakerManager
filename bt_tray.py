@@ -256,7 +256,11 @@ _REG_NAME = "BTSpeakerManager"
 def _exe_path() -> str:
     if getattr(sys, "frozen", False):
         return f'"{sys.executable}"'
-    return f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+    # Use pythonw.exe (windowless) instead of python.exe for startup
+    py = sys.executable
+    if py.endswith("python.exe"):
+        py = py.replace("python.exe", "pythonw.exe")
+    return f'"{py}" "{os.path.abspath(__file__)}"'
 
 
 def startup_enabled() -> bool:

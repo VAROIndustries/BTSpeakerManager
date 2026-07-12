@@ -1,5 +1,7 @@
 # BTSpeakerManager
 
+_Built by [VARØ Industries](https://varo.industries/apps)_
+
 A Windows system tray app that keeps Bluetooth speakers alive and connected.
 
 Bluetooth speakers go to sleep when there's no audio. Windows doesn't reconnect them or switch back when they wake up. This app fixes that.
