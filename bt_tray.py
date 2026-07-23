@@ -501,6 +501,15 @@ class App:
         else:
             self._icon.icon = ICO_DISCONNECTED
             self._icon.title = "BT Speaker \u2014 Disconnected"
+        # Rebuild the tray menu so the dynamic device list / status / checkmarks
+        # reflect the latest poll. On Windows pystray caches the native menu and
+        # only regenerates it on update_menu(); without this the menu stays
+        # frozen at its build-time state (e.g. the empty "(no devices found)"
+        # captured before the first enum completed at startup).
+        try:
+            self._icon.update_menu()
+        except Exception as e:
+            log.error("update_menu failed: %s", e)
 
     # ── Dynamic tray menu ────────────────────────────────────
 
