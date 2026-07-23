@@ -149,30 +149,41 @@ def _run_ps(command: str, timeout: int = 15) -> subprocess.CompletedProcess:
     )
 
 
-def enum_devices() -> list[dict]:
-    """Return active audio output endpoints as [{id, name}, ...]."""
-    try:
-        r = _run_ps(
-            "Get-PnpDevice -Class AudioEndpoint -Status OK | "
-            "Select-Object InstanceId, FriendlyName | "
-            "ConvertTo-Json -Compress"
-        )
-        if r.returncode != 0 or not r.stdout.strip():
-            return []
-        data = json.loads(r.stdout)
-        if isinstance(data, dict):
-            data = [data]
-        # Strip the SWD\MMDEVAPI\ prefix in Python (avoids PS regex escaping hell)
-        # Lowercase IDs for case-insensitive matching with pycaw
-        for d in data:
-            raw_id = d.get("InstanceId", "")
-            stripped = raw_id.replace(_MMDEVAPI_PREFIX, "", 1) if raw_id else ""
-            d["id"] = stripped.lower()
-            d["name"] = d.get("FriendlyName", "")
-        return data
-    except Exception as e:
-        log.error("enum_devices: %s", e)
-        return []
+def enum_devices() -> list[dict] | None:
+    """Return active audio output endpoints as [{id, name}, ...].
+
+    Returns None when the query itself failed (PowerShell timeout, non-zero
+    exit, or unparseable output) so callers can distinguish "query
+    unavailable" from "no devices present". A real machine always has at
+    least one audio endpoint, so an empty/failed result means the query is
+    unreliable — never that every device vanished. Treating that as a real
+    empty list is what caused the false-disconnect + reconnect-storm bug
+    (a single PS timeout across a sleep/resume flipped the app to
+    "Disconnected — no devices found"). Retries once before giving up.
+    """
+    for attempt in range(2):
+        try:
+            r = _run_ps(
+                "Get-PnpDevice -Class AudioEndpoint -Status OK | "
+                "Select-Object InstanceId, FriendlyName | "
+                "ConvertTo-Json -Compress"
+            )
+            if r.returncode != 0 or not r.stdout.strip():
+                continue  # transient failure — retry, then report None
+            data = json.loads(r.stdout)
+            if isinstance(data, dict):
+                data = [data]
+            # Strip the SWD\MMDEVAPI\ prefix in Python (avoids PS regex escaping hell)
+            # Lowercase IDs for case-insensitive matching with pycaw
+            for d in data:
+                raw_id = d.get("InstanceId", "")
+                stripped = raw_id.replace(_MMDEVAPI_PREFIX, "", 1) if raw_id else ""
+                d["id"] = stripped.lower()
+                d["name"] = d.get("FriendlyName", "")
+            return data
+        except Exception as e:
+            log.error("enum_devices (attempt %d): %s", attempt + 1, e)
+    return None
 
 
 def current_default_id() -> str | None:
@@ -298,6 +309,10 @@ class App:
         self._devs: list[dict] = []
         self._icon: pystray.Icon | None = None
         self._ka_lock = threading.Lock()
+        # Exponential reconnect backoff (monotonic clock, immune to sleep/resume
+        # wall-clock jumps). Prevents the fixed-30s pnputil hammer loop.
+        self._reconnect_attempts = 0
+        self._next_reconnect = 0.0
 
     # ── Keep-alive (continuous silent audio loop) ────────────
 
@@ -345,6 +360,14 @@ class App:
         fallback = self.cfg.get("fallback_name", "Realtek")
 
         devs = enum_devices()
+        if devs is None:
+            # Query failed (e.g. PS timeout across sleep/resume). "Unknown" is
+            # NOT "disconnected" — keep the previous state and device list so a
+            # transient hiccup never triggers a false disconnect or wipes the
+            # menu to "(no devices found)".
+            log.info("Device query unavailable; keeping previous state")
+            self._update_icon()
+            return
         self._devs = devs
         was = self._connected
         now = find_dev(devs, name) is not None
@@ -352,6 +375,7 @@ class App:
         if now and not was:
             # TRANSITION: disconnected → connected
             self._connected = True
+            self._reset_backoff()
             log.info("'%s' connected", name)
             spk = find_dev(devs, name)
             if spk:
@@ -382,26 +406,44 @@ class App:
                     log.error("Fallback failed: %s", e)
 
         elif not now and not was and bt_id:
-            # Still disconnected — attempt reconnect
-            log.info("Attempting reconnect '%s'...", name)
+            # Still disconnected — attempt reconnect with exponential backoff
+            # (30s, 60s, 120s, 240s, capped at 300s). Prevents the fixed-30s
+            # pnputil storm when the speaker is simply powered off.
+            if time.monotonic() < self._next_reconnect:
+                self._update_icon()
+                return
+            self._reconnect_attempts += 1
+            delay = min(30 * (2 ** (self._reconnect_attempts - 1)), 300)
+            self._next_reconnect = time.monotonic() + delay
+            log.info(
+                "Attempting reconnect '%s' (attempt %d, next in %ds)...",
+                name, self._reconnect_attempts, delay,
+            )
             bt_reconnect(bt_id)
             time.sleep(5)
             # Re-check after reconnect attempt
             devs = enum_devices()
-            self._devs = devs
-            if find_dev(devs, name) is not None:
-                self._connected = True
-                log.info("Reconnected '%s'", name)
-                spk = find_dev(devs, name)
-                if spk:
-                    try:
-                        set_default_endpoint(spk["id"])
-                        log.info("Default → '%s'", spk["name"])
-                    except Exception as e:
-                        log.error("Set default failed: %s", e)
-                self._ka_start()
+            if devs is not None:
+                self._devs = devs
+                if find_dev(devs, name) is not None:
+                    self._connected = True
+                    self._reset_backoff()
+                    log.info("Reconnected '%s'", name)
+                    spk = find_dev(devs, name)
+                    if spk:
+                        try:
+                            set_default_endpoint(spk["id"])
+                            log.info("Default → '%s'", spk["name"])
+                        except Exception as e:
+                            log.error("Set default failed: %s", e)
+                    self._ka_start()
 
         self._update_icon()
+
+    def _reset_backoff(self):
+        """Clear reconnect backoff after a successful (re)connection."""
+        self._reconnect_attempts = 0
+        self._next_reconnect = 0.0
 
     def _poll_loop(self):
         """Background thread: manage speaker connection."""
@@ -409,23 +451,27 @@ class App:
         try:
             # Detect initial state (avoid false transition on first poll)
             devs = enum_devices()
-            self._devs = devs
             name = self.cfg["speaker_name"]
-            spk = find_dev(devs, name)
-            if spk:
-                self._connected = True
-                log.info("Startup: '%s' already connected", name)
-                cur = current_default_id()
-                if cur != spk["id"]:
-                    try:
-                        set_default_endpoint(spk["id"])
-                        log.info("Startup: default → '%s'", spk["name"])
-                    except Exception as e:
-                        log.error("Startup set default: %s", e)
-                self._ka_start()
+            if devs is None:
+                # Can't tell yet — leave state as-is; the poll loop resolves it.
+                log.info("Startup: device query unavailable")
             else:
-                self._connected = False
-                log.info("Startup: '%s' not connected", name)
+                self._devs = devs
+                spk = find_dev(devs, name)
+                if spk:
+                    self._connected = True
+                    log.info("Startup: '%s' already connected", name)
+                    cur = current_default_id()
+                    if cur != spk["id"]:
+                        try:
+                            set_default_endpoint(spk["id"])
+                            log.info("Startup: default → '%s'", spk["name"])
+                        except Exception as e:
+                            log.error("Startup set default: %s", e)
+                    self._ka_start()
+                else:
+                    self._connected = False
+                    log.info("Startup: '%s' not connected", name)
             self._update_icon()
 
             # Poll loop
@@ -565,6 +611,7 @@ class App:
             log.info("Target → '%s' (bt_id: %s)", name, bt_id or "none")
             # Force re-evaluation on next poll
             self._connected = False
+            self._reset_backoff()
             self._threaded_poll()
 
         return action
@@ -606,6 +653,7 @@ class App:
 
     def _action_reconnect(self, icon, item):
         self._connected = False  # Force transition detection
+        self._reset_backoff()  # Manual reconnect ignores backoff window
         self._threaded_poll()
 
     def _action_quit(self, icon, item):
